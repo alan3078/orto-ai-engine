@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["python312"]
+
+[phases.install]
+cmds = ["pip install uv", "uv sync"]
+
+[start]
+cmd = "uv run python main.py"
