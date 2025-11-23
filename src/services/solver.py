@@ -1,11 +1,19 @@
-"""
-Solver service using Google OR-Tools CP-SAT.
+"""Solver service using Google OR-Tools CP-SAT.
 Handles the core mathematical optimization logic.
+
+Startup resilience: OR-Tools may not have wheels yet for very new Python
+versions (e.g. 3.13). We attempt import and degrade gracefully so the API
+still starts and health checks succeed instead of crashing the process.
 """
 
 import time
-from typing import Dict, List, Tuple
-from ortools.sat.python import cp_model
+from typing import Dict, List
+
+try:  # Graceful import for environments where OR-Tools wheel is unavailable
+    from ortools.sat.python import cp_model  # type: ignore
+except Exception as e:  # pragma: no cover
+    cp_model = None  # type: ignore
+    print(f"[startup] WARNING: Failed to import OR-Tools cp_model: {e}")
 
 from src.core.schemas import (
     SolveRequest,
@@ -42,6 +50,14 @@ class SolverService:
             SolveResponse with status and schedule
         """
         start_time = time.time()
+
+        if cp_model is None:
+            # Degrade gracefully; caller can surface message to user.
+            return SolveResponse(
+                status="ERROR",
+                message="OR-Tools not available in current runtime (wheel missing for Python version)",
+                solve_time_ms=(time.time() - start_time) * 1000,
+            )
         
         try:
             # Initialize model and variables
