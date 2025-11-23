@@ -1,0 +1,20 @@
+[project]
+name = "engine"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.121.3",
+    "ortools>=9.14.6206",
+    "pydantic>=2.12.4",
+    "pydantic-settings>=2.12.0",
+    "uvicorn>=0.38.0",
+]
+
+[dependency-groups]
+dev = [
+    "black>=25.11.0",
+    "mypy>=1.18.2",
+    "pytest>=9.0.1",
+    "ruff>=0.14.5",
+]
