@@ -4,7 +4,10 @@ API router for the solver endpoints.
 
 import time
 from fastapi import APIRouter, HTTPException
-from src.core.schemas import SolveRequest, SolveResponse, ValidateRequest, ValidateResponse
+from src.core.schemas import (
+    SolveRequest, SolveResponse, ValidateRequest, ValidateResponse,
+    ScheduleSummary, VerticalSummary, HorizontalSummary
+)
 from src.services.solver import solver_service
 from src.services.validator import ConstraintValidator
 
@@ -117,6 +120,14 @@ async def validate(request: ValidateRequest) -> ValidateResponse:
         passed = sum(1 for r in results if r.status == "PASS")
         failed = sum(1 for r in results if r.status == "FAIL")
         
+        # Build schedule summary
+        summary = _build_schedule_summary(
+            request.config,
+            request.schedule,
+            request.ic_assignments,
+            request.state_mapping
+        )
+        
         validation_time_ms = (time.time() - start_time) * 1000
         
         return ValidateResponse(
@@ -125,6 +136,7 @@ async def validate(request: ValidateRequest) -> ValidateResponse:
             passed_constraints=passed,
             failed_constraints=failed,
             results=results,
+            summary=summary,
             validation_time_ms=validation_time_ms
         )
     except Exception as e:
@@ -141,3 +153,93 @@ async def health_check():
         "status": "healthy",
         "service": "Universal Scheduler Solver Engine"
     }
+
+
+def _build_schedule_summary(
+    config,
+    schedule: dict,
+    ic_assignments: dict | None,
+    state_mapping: dict | None
+) -> ScheduleSummary:
+    """
+    Build summary statistics from schedule.
+    
+    Args:
+        config: Configuration with resources, time_slots, states
+        schedule: Schedule matrix {resource_id: [state_per_timeslot]}
+        ic_assignments: Optional IC matrix {resource_id: [time_slots]}
+        state_mapping: Optional state name mapping {name: state_int}
+        
+    Returns:
+        ScheduleSummary with vertical and horizontal breakdowns
+    """
+    time_slots = config.time_slots
+    resources = config.resources
+    states = config.states
+    
+    # Default state mapping if not provided
+    if not state_mapping:
+        state_mapping = {f"State_{s}": s for s in states}
+    
+    # Reverse mapping: state_int -> state_name
+    state_to_name = {v: k for k, v in state_mapping.items()}
+    
+    # Convert ic_assignments to a lookup: (resource, time_slot) -> bool
+    ic_lookup = set()
+    if ic_assignments:
+        for res_id, slots in ic_assignments.items():
+            for slot in slots:
+                ic_lookup.add((res_id, slot))
+    
+    # Build vertical summary (per time slot)
+    vertical_summary = []
+    for t in range(time_slots):
+        counts = {name: 0 for name in state_mapping.keys()}
+        ic_count = 0
+        
+        for res_id in resources:
+            state = schedule[res_id][t]
+            state_name = state_to_name.get(state, f"State_{state}")
+            if state_name in counts:
+                counts[state_name] += 1
+            
+            # Check IC
+            if (res_id, t) in ic_lookup:
+                ic_count += 1
+        
+        vertical_summary.append(VerticalSummary(
+            time_slot=t,
+            counts=counts,
+            ic_count=ic_count
+        ))
+    
+    # Build horizontal summary (per resource)
+    horizontal_summary = []
+    total_ic = 0
+    
+    for res_id in resources:
+        counts = {name: 0 for name in state_mapping.keys()}
+        ic_count = 0
+        
+        for t in range(time_slots):
+            state = schedule[res_id][t]
+            state_name = state_to_name.get(state, f"State_{state}")
+            if state_name in counts:
+                counts[state_name] += 1
+            
+            # Check IC
+            if (res_id, t) in ic_lookup:
+                ic_count += 1
+        
+        total_ic += ic_count
+        horizontal_summary.append(HorizontalSummary(
+            resource=res_id,
+            counts=counts,
+            ic_count=ic_count
+        ))
+    
+    return ScheduleSummary(
+        vertical_summary=vertical_summary,
+        horizontal_summary=horizontal_summary,
+        total_ic_count=total_ic
+    )

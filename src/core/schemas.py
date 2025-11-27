@@ -137,6 +137,29 @@ class ResourceStateCountConstraint(BaseModel):
     value: int = Field(..., ge=0, description="Required total occurrences (comparison target)")
 
 
+class CompoundAttributeVerticalSumConstraint(BaseModel):
+    """Constraint: Sum of specific state across resources filtered by MULTIPLE attributes (AND logic).
+    
+    Example: At least 1 female IC (gender=F AND roles contains IC) working (state=1) each time slot.
+    
+    The attribute_filters dictionary uses AND logic between different attributes,
+    and ANY-match logic within each attribute's value list.
+    """
+
+    type: Literal["compound_attribute_vertical_sum"] = "compound_attribute_vertical_sum"
+    time_slot: Union[int, Literal["ALL"]] = Field(
+        ...,
+        description="Time slot index or 'ALL' for all time slots"
+    )
+    target_state: int = Field(..., ge=0, description="State to count")
+    operator: Literal[">=", "<=", "=="] = Field(..., description="Comparison operator")
+    value: int = Field(..., ge=0, description="Target value for comparison")
+    attribute_filters: Dict[str, List[str]] = Field(
+        ...,
+        description="Attribute filters combined with AND logic. E.g., {'gender': ['F'], 'roles': ['IC']}"
+    )
+
+
 ConstraintModel = Union[
     PointConstraint,
     VerticalSumConstraint,
@@ -145,6 +168,7 @@ ConstraintModel = Union[
     PatternBlockConstraint,
     AttributeVerticalSumConstraint,
     ResourceStateCountConstraint,
+    CompoundAttributeVerticalSumConstraint,
 ]
 
 
@@ -291,6 +315,26 @@ class SolveRequest(BaseModel):
                     raise ValueError(
                         f"value {constraint.value} > time_slots length {len(constraint.time_slots)}"
                     )
+            elif isinstance(constraint, CompoundAttributeVerticalSumConstraint):
+                # Validate time slot
+                if constraint.time_slot != "ALL" and constraint.time_slot >= config.time_slots:
+                    raise ValueError(
+                        f"time_slot {constraint.time_slot} >= time_slots {config.time_slots}"
+                    )
+                if constraint.target_state not in config.states:
+                    raise ValueError(
+                        f"target_state {constraint.target_state} not in states {config.states}"
+                    )
+                if constraint.value > len(config.resources):
+                    raise ValueError(
+                        f"value {constraint.value} > number of resources {len(config.resources)}"
+                    )
+                # Attribute presence check (best-effort)
+                if config.resource_attributes is None:
+                    raise ValueError("compound_attribute_vertical_sum requires resource_attributes in config")
+                # Validate attribute_filters is not empty
+                if not constraint.attribute_filters:
+                    raise ValueError("compound_attribute_vertical_sum requires at least one attribute filter")
         
         return v
 
@@ -337,6 +381,14 @@ class ValidateRequest(BaseModel):
         None,
         description="Optional list of human-readable constraint names (same order as constraints)"
     )
+    ic_assignments: Optional[Dict[str, List[int]]] = Field(
+        None,
+        description="Optional IC assignment matrix: resource_id -> [time_slots where IC]. For summary."
+    )
+    state_mapping: Optional[Dict[str, int]] = Field(
+        None,
+        description="Optional state name mapping for summary display, e.g., {'Off': 0, 'Day': 1, 'Night': 2}"
+    )
     
     @field_validator('schedule')
     @classmethod
@@ -382,6 +434,40 @@ class ConstraintValidationResult(BaseModel):
     )
 
 
+class VerticalSummary(BaseModel):
+    """Vertical summary: Count per state per time slot."""
+    time_slot: int = Field(..., description="Time slot index")
+    date: Optional[str] = Field(None, description="Optional date string")
+    counts: Dict[str, int] = Field(
+        ...,
+        description="State counts {state_name: count}, e.g., {'Day': 5, 'Night': 2, 'Off': 8}"
+    )
+    ic_count: int = Field(0, description="Number of IC assignments at this time slot")
+
+
+class HorizontalSummary(BaseModel):
+    """Horizontal summary: Count per state per resource."""
+    resource: str = Field(..., description="Resource ID")
+    counts: Dict[str, int] = Field(
+        ...,
+        description="State counts {state_name: count}, e.g., {'Day': 10, 'Night': 5, 'Off': 15}"
+    )
+    ic_count: int = Field(0, description="Number of IC assignments for this resource")
+
+
+class ScheduleSummary(BaseModel):
+    """Summary statistics for the schedule."""
+    vertical_summary: List[VerticalSummary] = Field(
+        default_factory=list,
+        description="Per time slot: count of people in each shift state"
+    )
+    horizontal_summary: List[HorizontalSummary] = Field(
+        default_factory=list,
+        description="Per resource: count of shifts in each state"
+    )
+    total_ic_count: int = Field(0, description="Total number of IC assignments")
+
+
 class ValidateResponse(BaseModel):
     """Response model for the validate endpoint."""
     
@@ -395,6 +481,10 @@ class ValidateResponse(BaseModel):
     results: List[ConstraintValidationResult] = Field(
         ...,
         description="Detailed results for each constraint"
+    )
+    summary: Optional[ScheduleSummary] = Field(
+        None,
+        description="Summary statistics (vertical/horizontal counts, IC assignments)"
     )
     validation_time_ms: Optional[float] = Field(
         None,

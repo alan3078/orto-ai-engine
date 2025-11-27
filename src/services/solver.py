@@ -25,6 +25,7 @@ from src.core.schemas import (
     PatternBlockConstraint,
     AttributeVerticalSumConstraint,
     ResourceStateCountConstraint,
+    CompoundAttributeVerticalSumConstraint,
 )
 
 
@@ -154,6 +155,8 @@ class SolverService:
             self._apply_attribute_vertical_sum_constraint(constraint)
         elif isinstance(constraint, ResourceStateCountConstraint):
             self._apply_resource_state_count_constraint(constraint)
+        elif isinstance(constraint, CompoundAttributeVerticalSumConstraint):
+            self._apply_compound_attribute_vertical_sum_constraint(constraint)
     
     def _apply_point_constraint(self, constraint: PointConstraint):
         """
@@ -550,6 +553,80 @@ class SolverService:
             self.model.Add(sum_expr <= value)
         elif operator == "==":
             self.model.Add(sum_expr == value)
+
+    def _apply_compound_attribute_vertical_sum_constraint(
+        self, 
+        constraint: CompoundAttributeVerticalSumConstraint
+    ):
+        """Apply compound attribute filtered vertical sum constraint.
+        
+        Filters resources where ALL attribute conditions match (AND logic),
+        then counts resources in target_state at each time slot.
+        
+        Example: At least 1 female IC (gender=F AND roles contains IC) on each day shift.
+        """
+        target_state = constraint.target_state
+        operator = constraint.operator
+        value = constraint.value
+        attribute_filters = constraint.attribute_filters
+
+        if constraint.time_slot == "ALL":
+            slots = range(self.time_slots)
+        else:
+            slots = [constraint.time_slot]
+
+        # Pre-filter resources matching ALL attribute conditions (AND logic)
+        filtered_resources = []
+        for r in self.resources:
+            if r not in self.resource_attributes:
+                continue
+            
+            # Check all attribute filters (AND logic between attributes)
+            all_match = True
+            for attr_key, attr_values in attribute_filters.items():
+                if attr_key not in self.resource_attributes[r]:
+                    all_match = False
+                    break
+                
+                raw_val = self.resource_attributes[r][attr_key]
+                attr_values_set = set(attr_values)
+                
+                # Handle list attributes (e.g., roles: ['IC', 'RN'])
+                # ANY-match within the attribute's value list
+                if isinstance(raw_val, list):
+                    match = any(str(v) in attr_values_set for v in raw_val)
+                else:
+                    match = str(raw_val) in attr_values_set
+                
+                if not match:
+                    all_match = False
+                    break
+            
+            if all_match:
+                filtered_resources.append(r)
+
+        # Apply vertical sum constraint to filtered resources
+        for t in slots:
+            bool_vars = []
+            for resource in filtered_resources:
+                b = self.model.NewBoolVar(
+                    f"compound_{resource}_{t}_{target_state}"
+                )
+                self.model.Add(
+                    self.shifts[(resource, t)] == target_state
+                ).OnlyEnforceIf(b)
+                self.model.Add(
+                    self.shifts[(resource, t)] != target_state
+                ).OnlyEnforceIf(b.Not())
+                bool_vars.append(b)
+            
+            sum_expr = sum(bool_vars)
+            if operator == ">=":
+                self.model.Add(sum_expr >= value)
+            elif operator == "<=":
+                self.model.Add(sum_expr <= value)
+            elif operator == "==":
+                self.model.Add(sum_expr == value)
     
     def _extract_schedule(self, solver: cp_model.CpSolver) -> Dict[str, List[int]]:
         """

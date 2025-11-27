@@ -16,6 +16,7 @@ from src.core.schemas import (
     PatternBlockConstraint,
     AttributeVerticalSumConstraint,
     ResourceStateCountConstraint,
+    CompoundAttributeVerticalSumConstraint,
     ConstraintValidationResult,
 )
 
@@ -67,6 +68,8 @@ class ConstraintValidator:
             return self._validate_attribute_vertical_sum(constraint, index, name)
         elif isinstance(constraint, ResourceStateCountConstraint):
             return self._validate_resource_state_count(constraint, index, name)
+        elif isinstance(constraint, CompoundAttributeVerticalSumConstraint):
+            return self._validate_compound_attribute_vertical_sum(constraint, index, name)
         else:
             return ConstraintValidationResult(
                 constraint_index=index,
@@ -406,6 +409,87 @@ class ConstraintValidator:
                     "actual": count,
                     "target_state": constraint.target_state
                 }]
+            )
+
+    def _validate_compound_attribute_vertical_sum(
+        self,
+        constraint: CompoundAttributeVerticalSumConstraint,
+        index: int,
+        name: Optional[str]
+    ) -> ConstraintValidationResult:
+        """Validate compound attribute vertical sum: Filtered resource count by multiple attributes (AND logic)."""
+        # Filter resources by ALL attributes (AND logic)
+        filtered_resources = []
+        for res_id in self.config.resources:
+            if res_id not in self.resource_attrs:
+                continue
+            
+            # Check all attribute filters (AND logic)
+            all_match = True
+            for attr_key, attr_values in constraint.attribute_filters.items():
+                if attr_key not in self.resource_attrs[res_id]:
+                    all_match = False
+                    break
+                
+                res_attr_value = self.resource_attrs[res_id][attr_key]
+                attr_values_set = set(attr_values)
+                
+                # Handle both single values and lists
+                if isinstance(res_attr_value, list):
+                    match = any(str(val) in attr_values_set for val in res_attr_value)
+                else:
+                    match = str(res_attr_value) in attr_values_set
+                
+                if not match:
+                    all_match = False
+                    break
+            
+            if all_match:
+                filtered_resources.append(res_id)
+        
+        violations = []
+        time_slots = (
+            range(self.config.time_slots) 
+            if constraint.time_slot == "ALL" 
+            else [constraint.time_slot]
+        )
+        
+        for ts in time_slots:
+            count = sum(
+                1 for res_id in filtered_resources
+                if self.schedule[res_id][ts] == constraint.target_state
+            )
+            
+            passes = self._check_operator(count, constraint.operator, constraint.value)
+            
+            if not passes:
+                violations.append({
+                    "time_slot": ts,
+                    "expected": f"{constraint.operator} {constraint.value}",
+                    "actual": count,
+                    "attribute_filters": constraint.attribute_filters,
+                    "filtered_resources": filtered_resources
+                })
+        
+        filter_desc = " AND ".join(f"{k}={v}" for k, v in constraint.attribute_filters.items())
+        
+        if violations:
+            return ConstraintValidationResult(
+                constraint_index=index,
+                constraint_type="compound_attribute_vertical_sum",
+                constraint_name=name,
+                status="FAIL",
+                details=f"Failed at {len(violations)} time slot(s) for compound filter ({filter_desc})",
+                violations=violations
+            )
+        else:
+            return ConstraintValidationResult(
+                constraint_index=index,
+                constraint_type="compound_attribute_vertical_sum",
+                constraint_name=name,
+                status="PASS",
+                details=f"All time slots meet {constraint.operator} {constraint.value} workers matching ({filter_desc}) ✓",
+                violations=[]
             )
     
     @staticmethod
