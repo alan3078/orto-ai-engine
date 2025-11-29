@@ -39,6 +39,8 @@ class SolverService:
         self.time_slots = 0
         self.states = []
         self.resource_attributes = {}
+        self.penalties = []  # Track penalty terms for soft constraints
+        self.soft_violations = {}  # Track slack variables for reporting
     
     def solve(self, request: SolveRequest) -> SolveResponse:
         """
@@ -68,6 +70,13 @@ class SolverService:
             for constraint in request.constraints:
                 self._apply_constraint(constraint)
             
+            # Add fairness optimization: minimize variance across all shift types
+            self._add_fairness_objective()
+            
+            # Add optimization objective (fairness penalties + soft constraint penalties)
+            if self.penalties:
+                self.model.Minimize(sum(self.penalties))
+            
             # Solve the model
             solver = cp_model.CpSolver()
             solver.parameters.max_time_in_seconds = 300.0  # 5 minutes max
@@ -78,18 +87,20 @@ class SolverService:
             # Process results
             if status == cp_model.OPTIMAL:
                 schedule = self._extract_schedule(solver)
+                total_penalty = solver.ObjectiveValue() if self.penalties else 0
                 return SolveResponse(
                     status="OPTIMAL",
                     schedule=schedule,
-                    message="Found optimal solution",
+                    message=f"Found optimal solution (penalty: {total_penalty})" if self.penalties else "Found optimal solution",
                     solve_time_ms=solve_time_ms
                 )
             elif status == cp_model.FEASIBLE:
                 schedule = self._extract_schedule(solver)
+                total_penalty = solver.ObjectiveValue() if self.penalties else 0
                 return SolveResponse(
                     status="FEASIBLE",
                     schedule=schedule,
-                    message="Found feasible solution (may not be optimal)",
+                    message=f"Found feasible solution (penalty: {total_penalty})" if self.penalties else "Found feasible solution (may not be optimal)",
                     solve_time_ms=solve_time_ms
                 )
             elif status == cp_model.INFEASIBLE:
@@ -126,6 +137,8 @@ class SolverService:
         self.states = config.states
         self.resource_attributes = getattr(config, 'resource_attributes', {}) or {}
         self.shifts = {}
+        self.penalties = []  # Reset penalties for new solve
+        self.soft_violations = {}  # Reset violations tracking
         
         # Create decision variables
         # Each variable represents the state of a resource at a specific time slot
@@ -139,12 +152,67 @@ class SolverService:
                     var_name
                 )
     
+    def _add_fairness_objective(self):
+        """Add fairness optimization: minimize variance for each shift type.
+        
+        For each state (except OFF=0), minimize (max_count - min_count) across all resources.
+        This ensures fair distribution of ALL shift types automatically.
+        
+        Penalty weight is lower than soft constraints so hard constraints take priority.
+        """
+        FAIRNESS_WEIGHT = 10  # Lower weight than soft constraint penalties (100)
+        
+        # For each state > 0 (skip OFF state)
+        for state in self.states:
+            if state == 0:  # Skip OFF state
+                continue
+            
+            # Create IntVar for count of this state per resource
+            state_counts = {}
+            for resource in self.resources:
+                # Count how many times this resource is in this state
+                bool_vars = []
+                for t in range(self.time_slots):
+                    bv = self.model.NewBoolVar(f"fair_{resource}_{t}_{state}")
+                    self.model.Add(self.shifts[(resource, t)] == state).OnlyEnforceIf(bv)
+                    self.model.Add(self.shifts[(resource, t)] != state).OnlyEnforceIf(bv.Not())
+                    bool_vars.append(bv)
+                
+                # Total count for this resource and state
+                count_var = self.model.NewIntVar(0, self.time_slots, f"count_{resource}_{state}")
+                self.model.Add(count_var == sum(bool_vars))
+                state_counts[resource] = count_var
+            
+            # Find max and min across all resources for this state
+            all_counts = list(state_counts.values())
+            max_count = self.model.NewIntVar(0, self.time_slots, f"max_state_{state}")
+            min_count = self.model.NewIntVar(0, self.time_slots, f"min_state_{state}")
+            
+            self.model.AddMaxEquality(max_count, all_counts)
+            self.model.AddMinEquality(min_count, all_counts)
+            
+            # Variance = max - min (we want to minimize this)
+            variance = self.model.NewIntVar(0, self.time_slots, f"variance_state_{state}")
+            self.model.Add(variance == max_count - min_count)
+            
+            # Add penalty for variance
+            self.penalties.append(variance * FAIRNESS_WEIGHT)
+    
     def _apply_constraint(self, constraint):
-        """Apply a single constraint to the model."""
+        """Apply a single constraint to the model.
+        
+        Hard constraints (is_required=True) are enforced strictly.
+        Soft constraints (is_required=False) use slack variables with penalties.
+        """
+        is_required = getattr(constraint, 'is_required', True)
+        
         if isinstance(constraint, PointConstraint):
             self._apply_point_constraint(constraint)
         elif isinstance(constraint, VerticalSumConstraint):
-            self._apply_vertical_sum_constraint(constraint)
+            if is_required:
+                self._apply_vertical_sum_constraint(constraint)
+            else:
+                self._apply_vertical_sum_constraint_soft(constraint)
         elif isinstance(constraint, HorizontalSumConstraint):
             self._apply_horizontal_sum_constraint(constraint)
         elif isinstance(constraint, SlidingWindowConstraint):
@@ -154,7 +222,11 @@ class SolverService:
         elif isinstance(constraint, AttributeVerticalSumConstraint):
             self._apply_attribute_vertical_sum_constraint(constraint)
         elif isinstance(constraint, ResourceStateCountConstraint):
-            self._apply_resource_state_count_constraint(constraint)
+            is_required = getattr(constraint, 'is_required', True)
+            if is_required:
+                self._apply_resource_state_count_constraint(constraint)
+            else:
+                self._apply_resource_state_count_constraint_soft(constraint)
         elif isinstance(constraint, CompoundAttributeVerticalSumConstraint):
             self._apply_compound_attribute_vertical_sum_constraint(constraint)
     
@@ -553,6 +625,106 @@ class SolverService:
             self.model.Add(sum_expr <= value)
         elif operator == "==":
             self.model.Add(sum_expr == value)
+
+    def _apply_resource_state_count_constraint_soft(self, constraint: ResourceStateCountConstraint):
+        """Apply soft resource state count constraint with slack variables for violations.
+        
+        Instead of strict enforcement, allows violations with penalties.
+        Used for fairness constraints like night distribution.
+        """
+        resource = constraint.resource
+        target_state = constraint.target_state
+        operator = constraint.operator
+        value = constraint.value
+        time_slots = constraint.time_slots
+        
+        PENALTY_WEIGHT = 100  # Penalty per unit of violation
+
+        # Count occurrences of target_state
+        bool_vars = []
+        for t in time_slots:
+            b = self.model.NewBoolVar(f"rsc_soft_{resource}_{t}_{target_state}")
+            self.model.Add(self.shifts[(resource, t)] == target_state).OnlyEnforceIf(b)
+            self.model.Add(self.shifts[(resource, t)] != target_state).OnlyEnforceIf(b.Not())
+            bool_vars.append(b)
+        
+        count = sum(bool_vars)
+        
+        # Create slack variable for violation
+        max_violation = len(time_slots)
+        slack = self.model.NewIntVar(0, max_violation, f"slack_rsc_{resource}_{target_state}")
+        
+        if operator == ">=":
+            # count + slack >= value (slack measures shortfall)
+            self.model.Add(count + slack >= value)
+        elif operator == "<=":
+            # count <= value + slack (slack measures excess)
+            self.model.Add(count <= value + slack)
+        elif operator == "==":
+            # Use two slack vars for under/over
+            slack_under = self.model.NewIntVar(0, max_violation, f"slack_under_{resource}_{target_state}")
+            slack_over = self.model.NewIntVar(0, max_violation, f"slack_over_{resource}_{target_state}")
+            self.model.Add(count + slack_under - slack_over == value)
+            # Total slack is under + over
+            self.model.Add(slack == slack_under + slack_over)
+        
+        # Add penalty (weight per unit of violation)
+        self.penalties.append(slack * PENALTY_WEIGHT)
+        
+        # Track for reporting
+        self.soft_violations[f"rsc_{resource}_{target_state}"] = slack
+
+    def _apply_vertical_sum_constraint_soft(self, constraint: VerticalSumConstraint):
+        """Apply soft vertical sum constraint with slack variables for violations.
+        
+        Instead of strict enforcement, allows violations with penalties.
+        """
+        target_state = constraint.target_state
+        operator = constraint.operator
+        value = constraint.value
+        
+        PENALTY_WEIGHT = 100  # Penalty per unit of violation
+        
+        # Determine which time slots to apply to
+        if constraint.time_slot == "ALL":
+            time_slots_to_check = range(self.time_slots)
+        else:
+            time_slots_to_check = [constraint.time_slot]
+        
+        # Apply soft constraint to each time slot
+        for t in time_slots_to_check:
+            # Create boolean variables for "is this resource at target state?"
+            bool_vars = []
+            for resource in self.resources:
+                bool_var = self.model.NewBoolVar(f"soft_vs_{resource}_{t}_{target_state}")
+                
+                self.model.Add(
+                    self.shifts[(resource, t)] == target_state
+                ).OnlyEnforceIf(bool_var)
+                self.model.Add(
+                    self.shifts[(resource, t)] != target_state
+                ).OnlyEnforceIf(bool_var.Not())
+                
+                bool_vars.append(bool_var)
+            
+            count = sum(bool_vars)
+            
+            # Create slack variable for violation at this time slot
+            max_violation = len(self.resources)
+            slack = self.model.NewIntVar(0, max_violation, f"slack_vs_{t}_{target_state}")
+            
+            if operator == ">=":
+                self.model.Add(count + slack >= value)
+            elif operator == "<=":
+                self.model.Add(count <= value + slack)
+            elif operator == "==":
+                slack_under = self.model.NewIntVar(0, max_violation, f"slack_vs_under_{t}_{target_state}")
+                slack_over = self.model.NewIntVar(0, max_violation, f"slack_vs_over_{t}_{target_state}")
+                self.model.Add(count + slack_under - slack_over == value)
+                self.model.Add(slack == slack_under + slack_over)
+            
+            # Add penalty
+            self.penalties.append(slack * PENALTY_WEIGHT)
 
     def _apply_compound_attribute_vertical_sum_constraint(
         self, 

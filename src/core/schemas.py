@@ -46,6 +46,7 @@ class PointConstraint(BaseModel):
     resource: str = Field(..., description="Resource ID")
     time_slot: int = Field(..., ge=0, description="Time slot index")
     state: int = Field(..., ge=0, description="Required state value")
+    is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
 
 
 class VerticalSumConstraint(BaseModel):
@@ -59,6 +60,7 @@ class VerticalSumConstraint(BaseModel):
     target_state: int = Field(..., ge=0, description="State to count")
     operator: Literal[">=", "<=", "=="] = Field(..., description="Comparison operator")
     value: int = Field(..., ge=0, description="Target value for comparison")
+    is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
 
 
 class HorizontalSumConstraint(BaseModel):
@@ -74,6 +76,7 @@ class HorizontalSumConstraint(BaseModel):
     target_state: int = Field(..., ge=0, description="State to count")
     operator: Literal[">=", "<=", "=="] = Field(..., description="Comparison operator")
     value: int = Field(..., ge=0, description="Maximum/minimum consecutive occurrences")
+    is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
 
 
 class SlidingWindowConstraint(BaseModel):
@@ -84,6 +87,7 @@ class SlidingWindowConstraint(BaseModel):
     work_days: int = Field(..., gt=0, description="Number of consecutive work days")
     rest_days: int = Field(..., gt=0, description="Number of required rest days after work")
     target_state: int = Field(..., ge=1, description="State representing 'work' (typically 1)")
+    is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
 
 
 class PatternBlockConstraint(BaseModel):
@@ -104,6 +108,7 @@ class PatternBlockConstraint(BaseModel):
         None,
         description="Optional mapping from pattern names to state integers (e.g., {'NIGHT': 2, 'DAY': 1})"
     )
+    is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
 
 
 class AttributeVerticalSumConstraint(BaseModel):
@@ -123,6 +128,7 @@ class AttributeVerticalSumConstraint(BaseModel):
     attribute_values: List[str] = Field(
         ..., min_length=1, description="Allowed attribute values to include in filtered set"
     )
+    is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
 
 class ResourceStateCountConstraint(BaseModel):
     """Constraint: Total occurrences of a state for a resource across specified time slots.
@@ -135,6 +141,7 @@ class ResourceStateCountConstraint(BaseModel):
     target_state: int = Field(..., ge=0, description="State to count")
     operator: Literal[">=", "<=", "=="] = Field(..., description="Comparison operator")
     value: int = Field(..., ge=0, description="Required total occurrences (comparison target)")
+    is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
 
 
 class CompoundAttributeVerticalSumConstraint(BaseModel):
@@ -158,6 +165,7 @@ class CompoundAttributeVerticalSumConstraint(BaseModel):
         ...,
         description="Attribute filters combined with AND logic. E.g., {'gender': ['F'], 'roles': ['IC']}"
     )
+    is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
 
 
 ConstraintModel = Union[
