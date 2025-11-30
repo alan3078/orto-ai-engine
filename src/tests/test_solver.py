@@ -10,6 +10,8 @@ from src.core.schemas import (
     PointConstraint,
     VerticalSumConstraint,
     PatternBlockConstraint,
+    PreviousMonthAssignment,
+    SlidingWindowConstraint,
 )
 from src.services.solver import solver_service
 
@@ -392,3 +394,342 @@ def test_pattern_block_allows_night_to_off():
     # Should be feasible (NIGHT→OFF is allowed)
     assert response.status in ["OPTIMAL", "FEASIBLE"]
     assert response.schedule["A"] == [2, 0]
+
+
+# ============================================================================
+# Previous Month Integration Tests (FN/ADM/RST/002)
+# ============================================================================
+
+
+def test_previous_month_no_assignments():
+    """Test that solver works normally when no previous month assignments provided."""
+    request = SolveRequest(
+        config=ConfigModel(
+            resources=["A", "B"],
+            time_slots=3,
+            states=[0, 1]
+        ),
+        constraints=[
+            VerticalSumConstraint(
+                type="vertical_sum",
+                time_slot="ALL",
+                target_state=1,
+                operator=">=",
+                value=1
+            )
+        ],
+        previous_month_assignments=None
+    )
+    
+    response = solver_service.solve(request)
+    
+    assert response.status in ["OPTIMAL", "FEASIBLE"]
+    assert response.schedule is not None
+    assert len(response.schedule["A"]) == 3
+    assert len(response.schedule["B"]) == 3
+
+
+def test_previous_month_basic_integration():
+    """Test that previous month assignments are respected as fixed constraints."""
+    request = SolveRequest(
+        config=ConfigModel(
+            resources=["A", "B"],
+            time_slots=3,
+            states=[0, 1, 2]  # OFF, DAY, NIGHT
+        ),
+        constraints=[],
+        previous_month_assignments=[
+            # A worked NIGHT on last day of previous month
+            PreviousMonthAssignment(resource="A", offset_days=1, state=2),
+            # B was OFF on last day of previous month  
+            PreviousMonthAssignment(resource="B", offset_days=1, state=0),
+        ]
+    )
+    
+    response = solver_service.solve(request)
+    
+    assert response.status in ["OPTIMAL", "FEASIBLE"]
+    assert response.schedule is not None
+    # Output should only contain current month (3 days)
+    assert len(response.schedule["A"]) == 3
+    assert len(response.schedule["B"]) == 3
+
+
+def test_previous_month_pattern_block_at_boundary():
+    """
+    Test pattern_block constraint blocks Night→Day at month boundary.
+    
+    Scenario: 
+    - Resource A had NIGHT on last day of previous month (offset_days=1)
+    - PatternBlock constraint blocks NIGHT→DAY
+    - First day of current month should NOT be DAY for A
+    """
+    request = SolveRequest(
+        config=ConfigModel(
+            resources=["A"],
+            time_slots=2,
+            states=[0, 1, 2]  # OFF, DAY, NIGHT
+        ),
+        constraints=[
+            # Block NIGHT→DAY pattern
+            PatternBlockConstraint(
+                type="pattern_block",
+                pattern=["NIGHT", "DAY"],
+                resources="ALL",
+                state_mapping={"NIGHT": 2, "DAY": 1, "OFF": 0}
+            )
+        ],
+        previous_month_assignments=[
+            # A worked NIGHT on last day of previous month
+            PreviousMonthAssignment(resource="A", offset_days=1, state=2),
+        ]
+    )
+    
+    response = solver_service.solve(request)
+    
+    assert response.status in ["OPTIMAL", "FEASIBLE"]
+    assert response.schedule is not None
+    # First day of current month should NOT be DAY (state=1) due to pattern block
+    assert response.schedule["A"][0] != 1, "First day should not be DAY after NIGHT"
+
+
+def test_previous_month_pattern_block_infeasible():
+    """
+    Test that infeasible scenario with previous month is correctly detected.
+    
+    Scenario:
+    - Resource A had NIGHT on last day of previous month
+    - We force A to have DAY on first day of current month
+    - PatternBlock forbids NIGHT→DAY
+    - Should be INFEASIBLE
+    """
+    request = SolveRequest(
+        config=ConfigModel(
+            resources=["A"],
+            time_slots=2,
+            states=[0, 1, 2]  # OFF, DAY, NIGHT
+        ),
+        constraints=[
+            # Force DAY on first day of current month
+            PointConstraint(type="point", resource="A", time_slot=0, state=1),
+            # Block NIGHT→DAY pattern
+            PatternBlockConstraint(
+                type="pattern_block",
+                pattern=["NIGHT", "DAY"],
+                resources="ALL",
+                state_mapping={"NIGHT": 2, "DAY": 1, "OFF": 0}
+            )
+        ],
+        previous_month_assignments=[
+            # A worked NIGHT on last day of previous month
+            PreviousMonthAssignment(resource="A", offset_days=1, state=2),
+        ]
+    )
+    
+    response = solver_service.solve(request)
+    
+    # Should be INFEASIBLE since NIGHT→DAY is blocked but required
+    assert response.status == "INFEASIBLE"
+
+
+def test_previous_month_multiple_days():
+    """Test with multiple previous month days (e.g., last 3 days)."""
+    request = SolveRequest(
+        config=ConfigModel(
+            resources=["A"],
+            time_slots=3,
+            states=[0, 1, 2]  # OFF, DAY, NIGHT
+        ),
+        constraints=[
+            PatternBlockConstraint(
+                type="pattern_block",
+                pattern=["NIGHT", "DAY"],
+                resources="ALL",
+                state_mapping={"NIGHT": 2, "DAY": 1, "OFF": 0}
+            )
+        ],
+        previous_month_assignments=[
+            # A's assignments from previous month
+            # offset_days=3: third-to-last day - DAY
+            PreviousMonthAssignment(resource="A", offset_days=3, state=1),
+            # offset_days=2: second-to-last day - NIGHT
+            PreviousMonthAssignment(resource="A", offset_days=2, state=2),
+            # offset_days=1: last day - NIGHT
+            PreviousMonthAssignment(resource="A", offset_days=1, state=2),
+        ]
+    )
+    
+    response = solver_service.solve(request)
+    
+    assert response.status in ["OPTIMAL", "FEASIBLE"]
+    # First day should not be DAY (due to previous NIGHT)
+    assert response.schedule["A"][0] != 1
+
+
+def test_previous_month_allows_valid_transition():
+    """Test that valid transitions from previous month are allowed."""
+    request = SolveRequest(
+        config=ConfigModel(
+            resources=["A"],
+            time_slots=2,
+            states=[0, 1, 2]  # OFF, DAY, NIGHT
+        ),
+        constraints=[
+            # Force DAY on first day
+            PointConstraint(type="point", resource="A", time_slot=0, state=1),
+            # Block NIGHT→DAY pattern
+            PatternBlockConstraint(
+                type="pattern_block",
+                pattern=["NIGHT", "DAY"],
+                resources="ALL",
+                state_mapping={"NIGHT": 2, "DAY": 1, "OFF": 0}
+            )
+        ],
+        previous_month_assignments=[
+            # A was OFF on last day of previous month (not NIGHT)
+            PreviousMonthAssignment(resource="A", offset_days=1, state=0),
+        ]
+    )
+    
+    response = solver_service.solve(request)
+    
+    # Should be FEASIBLE since OFF→DAY is allowed
+    assert response.status in ["OPTIMAL", "FEASIBLE"]
+    assert response.schedule["A"][0] == 1  # DAY is allowed
+
+
+def test_previous_month_schedule_output_excludes_overlap():
+    """Verify that output schedule only contains current month days."""
+    request = SolveRequest(
+        config=ConfigModel(
+            resources=["A", "B"],
+            time_slots=5,
+            states=[0, 1, 2]
+        ),
+        constraints=[],
+        previous_month_assignments=[
+            PreviousMonthAssignment(resource="A", offset_days=1, state=2),
+            PreviousMonthAssignment(resource="A", offset_days=2, state=2),
+            PreviousMonthAssignment(resource="B", offset_days=1, state=1),
+        ]
+    )
+    
+    response = solver_service.solve(request)
+    
+    assert response.status in ["OPTIMAL", "FEASIBLE"]
+    # Output should only have 5 slots (current month), not 7 (5 + 2 overlap)
+    assert len(response.schedule["A"]) == 5
+    assert len(response.schedule["B"]) == 5
+
+
+def test_previous_month_validation_invalid_resource():
+    """Test validation catches invalid resource in previous month assignments."""
+    with pytest.raises(ValueError, match="not in resources list"):
+        SolveRequest(
+            config=ConfigModel(
+                resources=["A", "B"],
+                time_slots=3,
+                states=[0, 1, 2]
+            ),
+            constraints=[],
+            previous_month_assignments=[
+                PreviousMonthAssignment(resource="Z", offset_days=1, state=1),
+            ]
+        )
+
+
+def test_previous_month_validation_invalid_state():
+    """Test validation catches invalid state in previous month assignments."""
+    with pytest.raises(ValueError, match="not in states"):
+        SolveRequest(
+            config=ConfigModel(
+                resources=["A"],
+                time_slots=3,
+                states=[0, 1, 2]
+            ),
+            constraints=[],
+            previous_month_assignments=[
+                PreviousMonthAssignment(resource="A", offset_days=1, state=5),
+            ]
+        )
+
+
+def test_previous_month_sliding_window_enforces_rest():
+    """Test that sliding_window constraint enforces rest days after night shift from previous month.
+    
+    Scenario: NUR006 worked Night (E=2) on Oct 30 (offset_days=2).
+    With post_night_rest rule (work_days=1, rest_days=2), they need 2 days off.
+    Oct 31 (offset_days=1) was Off (0), so Nov 1 (slot 0) must also be Off.
+    """
+    request = SolveRequest(
+        config=ConfigModel(
+            resources=["NUR006"],
+            time_slots=5,  # Nov 1-5
+            states=[0, 1, 2]  # 0=Off, 1=Day, 2=Night
+        ),
+        constraints=[
+            SlidingWindowConstraint(
+                resource="NUR006",
+                work_days=1,
+                rest_days=2,
+                target_state=2  # Night
+            )
+        ],
+        previous_month_assignments=[
+            # Oct 30 = Night (E), offset_days=2
+            PreviousMonthAssignment(resource="NUR006", offset_days=2, state=2),
+            # Oct 31 = Off, offset_days=1
+            PreviousMonthAssignment(resource="NUR006", offset_days=1, state=0),
+        ]
+    )
+    
+    response = solver_service.solve(request)
+    
+    assert response.status in ["OPTIMAL", "FEASIBLE"]
+    # Nov 1 (slot 0) MUST be Off (state 0) because:
+    # Oct 30 was Night → needs 2 rest days → Oct 31 (Off) + Nov 1 (must be Off)
+    assert response.schedule["NUR006"][0] == 0, \
+        f"Expected Nov 1 to be Off (0), got {response.schedule['NUR006'][0]}"
+
+
+def test_previous_month_sliding_window_allows_work_after_rest():
+    """Test that work is allowed after proper rest period from previous month night.
+    
+    Scenario: Night on Oct 29 (offset_days=3), Off on Oct 30 and Oct 31.
+    Nov 1 can be any state because 2 rest days already taken.
+    """
+    request = SolveRequest(
+        config=ConfigModel(
+            resources=["A"],
+            time_slots=3,
+            states=[0, 1, 2]
+        ),
+        constraints=[
+            SlidingWindowConstraint(
+                resource="A",
+                work_days=1,
+                rest_days=2,
+                target_state=2  # Night
+            ),
+            # Force Nov 1 to be Day (1) - should be allowed
+            PointConstraint(
+                resource="A",
+                time_slot=0,
+                state=1
+            )
+        ],
+        previous_month_assignments=[
+            # Oct 29 = Night, offset_days=3
+            PreviousMonthAssignment(resource="A", offset_days=3, state=2),
+            # Oct 30 = Off, offset_days=2
+            PreviousMonthAssignment(resource="A", offset_days=2, state=0),
+            # Oct 31 = Off, offset_days=1
+            PreviousMonthAssignment(resource="A", offset_days=1, state=0),
+        ]
+    )
+    
+    response = solver_service.solve(request)
+    
+    assert response.status in ["OPTIMAL", "FEASIBLE"]
+    # Nov 1 should be Day (1) as requested - rest was already satisfied
+    assert response.schedule["A"][0] == 1

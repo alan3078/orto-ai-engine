@@ -168,6 +168,34 @@ class CompoundAttributeVerticalSumConstraint(BaseModel):
     is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
 
 
+# ============================================================================
+# Previous Month Integration (FN/ADM/RST/002)
+# ============================================================================
+
+
+class PreviousMonthAssignment(BaseModel):
+    """Fixed assignment from the previous month's roster.
+    
+    Used to ensure continuity constraints (like post-night rest, consecutive 
+    shift limits) are respected across month boundaries.
+    
+    The offset_days field indicates how many days before the current month's 
+    start this assignment occurred. For example:
+    - offset_days=1: Last day of previous month
+    - offset_days=2: Second-to-last day of previous month
+    - offset_days=3: Third-to-last day of previous month
+    """
+    
+    resource: str = Field(..., description="Resource ID (must exist in config.resources)")
+    offset_days: int = Field(
+        ..., 
+        ge=1, 
+        le=7, 
+        description="Days before current month start (1=last day, 2=second-to-last, etc.)"
+    )
+    state: int = Field(..., ge=0, description="State value from previous month assignment")
+
+
 ConstraintModel = Union[
     PointConstraint,
     VerticalSumConstraint,
@@ -188,6 +216,36 @@ class SolveRequest(BaseModel):
         default_factory=list,
         description="List of constraints to apply"
     )
+    previous_month_assignments: Optional[List[PreviousMonthAssignment]] = Field(
+        default=None,
+        description="Fixed assignments from previous month for continuity constraints (e.g., last 3-7 days)"
+    )
+    
+    @field_validator('previous_month_assignments')
+    @classmethod
+    def validate_previous_month_assignments(cls, v, info):
+        """Validate previous month assignments against config."""
+        if v is None:
+            return v
+            
+        if 'config' not in info.data:
+            return v
+            
+        config = info.data['config']
+        
+        for assignment in v:
+            # Validate resource exists
+            if assignment.resource not in config.resources:
+                raise ValueError(
+                    f"Previous month assignment resource '{assignment.resource}' not in resources list"
+                )
+            # Validate state in range
+            if assignment.state not in config.states:
+                raise ValueError(
+                    f"Previous month assignment state {assignment.state} not in states {config.states}"
+                )
+        
+        return v
     
     @field_validator('constraints')
     @classmethod
