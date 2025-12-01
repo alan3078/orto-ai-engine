@@ -168,6 +168,65 @@ class CompoundAttributeVerticalSumConstraint(BaseModel):
     is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
 
 
+class MinConsecutiveConstraint(BaseModel):
+    """Constraint: Minimum consecutive occurrences of a state (no isolated single occurrences).
+    
+    Example: Night shifts must occur in blocks of at least 2 (no isolated single night shifts).
+    This prevents patterns like: O E O (single E not allowed), requires O E E O (at least 2).
+    """
+
+    type: Literal["min_consecutive"] = "min_consecutive"
+    resource: str = Field(..., description="Resource ID")
+    time_slots: List[int] = Field(
+        ...,
+        min_length=1,
+        description="Time slots to evaluate"
+    )
+    target_state: int = Field(..., ge=0, description="State that must appear in minimum blocks")
+    min_block: int = Field(..., ge=2, description="Minimum consecutive occurrences required")
+    is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
+
+
+class NightBlockGapConstraint(BaseModel):
+    """Constraint: Minimum gap (in days/slots) between night shift blocks.
+    
+    Example: After a night block ends, at least 7 days before starting another night block.
+    This ensures patterns like: E E O O O O O O O E E (7-day gap between blocks).
+    Prevents: E E O O E E (only 2-day gap - not allowed with 7-day requirement).
+    """
+
+    type: Literal["night_block_gap"] = "night_block_gap"
+    resource: str = Field(..., description="Resource ID")
+    time_slots: List[int] = Field(
+        ...,
+        min_length=1,
+        description="Time slots to evaluate"
+    )
+    target_state: int = Field(..., ge=0, description="Night state to track blocks of")
+    min_gap_days: int = Field(..., ge=1, description="Minimum days between night blocks")
+    is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
+
+
+class PostBlockRestConstraint(BaseModel):
+    """Constraint: Enforce rest days after any block of target_state ends (dynamic block detection).
+    
+    Example: After any night block ends (whether 1, 2, or 3 nights), require 2 rest days.
+    This detects the END of a night block (transition from night to non-night) and enforces
+    that the next N days must be OFF.
+    
+    Pattern detection: When shift[t] == target_state AND shift[t+1] != target_state,
+    then shift[t+1] through shift[t+rest_days] must all be OFF (state 0).
+    
+    This is more flexible than SlidingWindowConstraint which requires a fixed work_days.
+    """
+
+    type: Literal["post_block_rest"] = "post_block_rest"
+    resource: str = Field(..., description="Resource ID")
+    target_state: int = Field(..., ge=1, description="State representing the block type (e.g., night=2)")
+    rest_days: int = Field(..., ge=1, description="Number of required rest days (OFF) after block ends")
+    is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
+
+
 # ============================================================================
 # Previous Month Integration (FN/ADM/RST/002)
 # ============================================================================
@@ -205,6 +264,9 @@ ConstraintModel = Union[
     AttributeVerticalSumConstraint,
     ResourceStateCountConstraint,
     CompoundAttributeVerticalSumConstraint,
+    MinConsecutiveConstraint,
+    NightBlockGapConstraint,
+    PostBlockRestConstraint,
 ]
 
 

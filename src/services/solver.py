@@ -27,6 +27,9 @@ from src.core.schemas import (
     ResourceStateCountConstraint,
     CompoundAttributeVerticalSumConstraint,
     PreviousMonthAssignment,
+    MinConsecutiveConstraint,
+    NightBlockGapConstraint,
+    PostBlockRestConstraint,
 )
 
 
@@ -72,7 +75,12 @@ class SolverService:
             
             # Apply previous month assignments as fixed constraints (if any)
             if request.previous_month_assignments:
+                print(f"[Solver] Applying {len(request.previous_month_assignments)} previous month assignments")
+                for pa in request.previous_month_assignments[:5]:  # Log first 5
+                    print(f"  - {pa.resource}: offset_days={pa.offset_days}, state={pa.state}")
                 self._apply_previous_month_assignments(request.previous_month_assignments)
+            else:
+                print("[Solver] No previous month assignments provided")
             
             # Apply all constraints
             for constraint in request.constraints:
@@ -193,11 +201,21 @@ class SolverService:
         
         offset_days=1 → internal index (previous_month_offset - 1) = last previous day
         offset_days=2 → internal index (previous_month_offset - 2) = second-to-last
+        
+        Also tracks values in _previous_month_values for cross-month constraint logic.
         """
+        # Initialize tracking dict for min_consecutive cross-month logic
+        self._previous_month_values: dict[str, dict[int, int]] = {}
+        
         for assignment in assignments:
             # Convert offset_days to internal index
             # offset_days=1 means last day of previous month
             internal_index = self.previous_month_offset - assignment.offset_days
+            
+            # Track the value for cross-month constraint logic
+            if assignment.resource not in self._previous_month_values:
+                self._previous_month_values[assignment.resource] = {}
+            self._previous_month_values[assignment.resource][internal_index] = assignment.state
             
             # Apply as fixed constraint (hard)
             self.model.Add(
@@ -284,6 +302,12 @@ class SolverService:
                 self._apply_resource_state_count_constraint_soft(constraint)
         elif isinstance(constraint, CompoundAttributeVerticalSumConstraint):
             self._apply_compound_attribute_vertical_sum_constraint(constraint)
+        elif isinstance(constraint, MinConsecutiveConstraint):
+            self._apply_min_consecutive_constraint(constraint)
+        elif isinstance(constraint, NightBlockGapConstraint):
+            self._apply_night_block_gap_constraint(constraint)
+        elif isinstance(constraint, PostBlockRestConstraint):
+            self._apply_post_block_rest_constraint(constraint)
     
     def _apply_point_constraint(self, constraint: PointConstraint):
         """
@@ -361,12 +385,13 @@ class SolverService:
         Strategy: Use sliding window to check all consecutive sequences.
         For each window of size (value + 1), ensure not all are target_state.
         
+        Cross-month handling: Include previous month slots in window checks so that
+        windows can span across month boundaries (e.g., Oct 31 + Nov 1-3 for max=3).
+        
         Note: constraint.time_slots are external indices, converted to internal.
         """
         resource = constraint.resource
         ext_time_slots = constraint.time_slots
-        # Convert external time slots to internal indices
-        int_time_slots = [self._to_internal_index(t) for t in ext_time_slots]
         target_state = constraint.target_state
         operator = constraint.operator
         value = constraint.value
@@ -376,8 +401,31 @@ class SolverService:
             # at least one must NOT be target_state
             window_size = value + 1
             
-            for start_idx in range(len(int_time_slots) - window_size + 1):
-                window = int_time_slots[start_idx:start_idx + window_size]
+            # CROSS-MONTH: Build combined slot list including previous month
+            # Previous month internal indices: 0 to (previous_month_offset - 1)
+            # Current month external 0 -> internal previous_month_offset
+            all_int_slots = []
+            
+            # Add previous month slots (these are already in internal indices)
+            for prev_int_t in range(self.previous_month_offset):
+                all_int_slots.append(prev_int_t)
+            
+            # Add current month slots (convert external to internal)
+            sorted_ext_slots = sorted(ext_time_slots)
+            for ext_t in sorted_ext_slots:
+                int_t = self._to_internal_index(ext_t)
+                all_int_slots.append(int_t)
+            
+            # Create windows that may span previous + current month
+            # We need to constrain windows that include at least one current month slot
+            for start_idx in range(len(all_int_slots) - window_size + 1):
+                window = all_int_slots[start_idx:start_idx + window_size]
+                
+                # Only enforce constraint if at least one slot in window is from current month
+                # (i.e., internal index >= previous_month_offset)
+                has_current_month = any(int_t >= self.previous_month_offset for int_t in window)
+                if not has_current_month:
+                    continue  # Skip windows entirely in previous month (already fixed)
                 
                 # Create bool vars for each slot in window
                 bool_vars = []
@@ -908,6 +956,268 @@ class SolverService:
                 self.model.Add(sum_expr <= value)
             elif operator == "==":
                 self.model.Add(sum_expr == value)
+
+    def _apply_min_consecutive_constraint(self, constraint: MinConsecutiveConstraint):
+        """
+        Apply minimum consecutive constraint: No isolated single occurrences.
+        
+        Example: Night shifts must occur in blocks of at least 2 (min_block=2).
+        Pattern O E O is forbidden (single E), must be O E E O or similar.
+        
+        Implementation: For each occurrence of target_state, at least one neighbor
+        must also be target_state (except at boundaries where we're more lenient).
+        
+        Cross-month handling: 
+        1. Include previous month in neighbor checks for first days of current month.
+        2. If previous month ends with an INCOMPLETE block (size < min_block),
+           FORCE first days of current month to be target_state to complete the block.
+        """
+        resource = constraint.resource
+        ext_time_slots = constraint.time_slots
+        target_state = constraint.target_state
+        min_block = constraint.min_block
+        
+        if min_block < 2:
+            return  # No constraint needed
+        
+        # Sort time slots
+        sorted_slots = sorted(ext_time_slots)
+        n = len(sorted_slots)
+        
+        if n < min_block:
+            return  # Not enough slots to form a block
+        
+        # Include previous month days in the slot range for cross-month constraints
+        # Previous month internal indices: 0 to (previous_month_offset - 1)
+        # Current month external 0 -> internal previous_month_offset
+        all_internal_slots = []
+        
+        # Add previous month slots (if any)
+        for prev_int_t in range(self.previous_month_offset):
+            all_internal_slots.append((-self.previous_month_offset + prev_int_t, prev_int_t))  # (virtual_ext, int_t)
+        
+        # Add current month slots
+        for ext_t in sorted_slots:
+            int_t = self._to_internal_index(ext_t)
+            all_internal_slots.append((ext_t, int_t))
+        
+        # Create boolean vars for ALL slots (including previous month)
+        is_target = {}
+        for (ext_t, int_t) in all_internal_slots:
+            b = self.model.NewBoolVar(f"min_consec_{resource}_{ext_t}_is_{target_state}")
+            self.model.Add(self.shifts[(resource, int_t)] == target_state).OnlyEnforceIf(b)
+            self.model.Add(self.shifts[(resource, int_t)] != target_state).OnlyEnforceIf(b.Not())
+            is_target[ext_t] = b
+        
+        # CROSS-MONTH: Check if previous month ends with an incomplete block
+        # If so, FORCE continuation into current month to complete the block
+        if self.previous_month_offset > 0:
+            self._force_incomplete_block_continuation(resource, target_state, min_block, sorted_slots)
+        
+        # For min_block=2: if slot[i] is target, then either slot[i-1] or slot[i+1] must be target
+        # This prevents isolated singles
+        # Only enforce on CURRENT month slots (not previous month), but neighbors can be from previous month
+        for i, ext_t in enumerate(sorted_slots):
+            neighbors = []
+            
+            # Find index in all_internal_slots for this current month slot
+            all_ext_slots = [s[0] for s in all_internal_slots]
+            full_idx = all_ext_slots.index(ext_t)
+            
+            # Previous neighbor (could be from previous month)
+            if full_idx > 0:
+                prev_ext = all_ext_slots[full_idx - 1]
+                neighbors.append(is_target[prev_ext])
+            
+            # Next neighbor (current month only)
+            if full_idx < len(all_ext_slots) - 1:
+                next_ext = all_ext_slots[full_idx + 1]
+                neighbors.append(is_target[next_ext])
+            
+            # Debug: Log the last few slots
+            if ext_t >= len(sorted_slots) - 3:
+                print(f"[Solver DEBUG] min_consec for {resource} slot {ext_t}: neighbors count={len(neighbors)}, full_idx={full_idx}, all_ext_slots len={len(all_ext_slots)}")
+            
+            if neighbors:
+                # If this slot is target_state, at least one neighbor must also be target_state
+                self.model.Add(sum(neighbors) >= 1).OnlyEnforceIf(is_target[ext_t])
+            else:
+                # No neighbors means this is an edge slot - for min_block=2, 
+                # we should NOT allow a single isolated target_state at the very edge
+                # unless it's being continued to/from the next/previous month
+                # Force this slot to NOT be target_state if it has no neighbors
+                print(f"[Solver] WARNING: Slot {ext_t} for {resource} has NO neighbors for min_consecutive check - forcing NOT target_state")
+                # If no neighbors (edge case), prevent isolated single at end of month
+                self.model.Add(self.shifts[(resource, self._to_internal_index(ext_t))] != target_state)
+    
+    def _force_incomplete_block_continuation(self, resource: str, target_state: int, min_block: int, current_month_slots: List[int]):
+        """
+        If previous month ends with an incomplete block (1 to min_block-1 consecutive target_states
+        at the end), force first days of current month to complete the block.
+        
+        Example: If min_block=2 and previous month ends with a single E (Oct 31=E, Oct 30=O),
+        then Nov 1 MUST be E to make it a valid block of 2.
+        
+        Example: If min_block=3 and previous month ends with E E (Oct 30-31=E, Oct 29=O),
+        then Nov 1 MUST be E to make it a valid block of 3.
+        
+        IMPORTANT: Only counts days where we have explicit previous month data.
+        Missing data is treated as "unknown" and breaks the count to be conservative.
+        """
+        if not hasattr(self, '_previous_month_values'):
+            return  # No previous month data tracked
+        
+        prev_values = self._previous_month_values.get(resource, {})
+        if not prev_values:
+            return
+        
+        # Count trailing consecutive target_states at the end of previous month
+        # Start from the last day of previous month (internal index = previous_month_offset - 1)
+        # and count backwards until we find a non-target OR missing data
+        trailing_count = 0
+        for int_t in range(self.previous_month_offset - 1, -1, -1):
+            value = prev_values.get(int_t)
+            if value is None:
+                # Missing data - we can't be sure, so stop counting
+                # This is conservative: we only force continuation if we KNOW
+                # there's an incomplete block
+                break
+            if value == target_state:
+                trailing_count += 1
+            else:
+                break  # Found a non-target state, stop counting
+        
+        # If there's no trailing block at all, nothing to continue
+        if trailing_count == 0:
+            return
+        
+        # If trailing block is already complete (>= min_block), no forcing needed
+        if trailing_count >= min_block:
+            return
+        
+        # Incomplete block found! Need to force (min_block - trailing_count) days in current month
+        days_needed = min_block - trailing_count
+        
+        print(f"[Solver] Forcing {days_needed} days of state {target_state} for {resource} to complete incomplete block from previous month (trailing_count={trailing_count}, min_block={min_block})")
+        
+        # Force first N days of current month to be target_state
+        for i in range(min(days_needed, len(current_month_slots))):
+            ext_t = current_month_slots[i]
+            int_t = self._to_internal_index(ext_t)
+            self.model.Add(self.shifts[(resource, int_t)] == target_state)
+
+    def _apply_night_block_gap_constraint(self, constraint: NightBlockGapConstraint):
+        """
+        Apply night block gap constraint: Minimum gap between night shift blocks.
+        
+        Example: After a night block ends, at least 7 days before starting another.
+        Pattern: E E O O O O O O O E E is OK (7-day gap), E E O O E E is NOT (2-day gap).
+        
+        Cross-month handling: If previous month data exists, we include it to detect
+        blocks that ended in previous month and enforce gap into current month.
+        """
+        resource = constraint.resource
+        ext_time_slots = constraint.time_slots
+        target_state = constraint.target_state
+        min_gap_days = constraint.min_gap_days
+        
+        # Build combined slot list including previous month
+        all_slots = []  # List of (external_slot, internal_index)
+        
+        # Add previous month slots
+        for prev_int_t in range(self.previous_month_offset):
+            virtual_ext = prev_int_t - self.previous_month_offset  # Negative values for prev month
+            all_slots.append((virtual_ext, prev_int_t))
+        
+        # Add current month slots
+        sorted_ext_slots = sorted(ext_time_slots)
+        for ext_t in sorted_ext_slots:
+            int_t = self._to_internal_index(ext_t)
+            all_slots.append((ext_t, int_t))
+        
+        n = len(all_slots)
+        if n < 2:
+            return
+        
+        # Create boolean vars for all slots
+        is_target = {}
+        for (ext_t, int_t) in all_slots:
+            b = self.model.NewBoolVar(f"gap_{resource}_{ext_t}_is_{target_state}")
+            self.model.Add(self.shifts[(resource, int_t)] == target_state).OnlyEnforceIf(b)
+            self.model.Add(self.shifts[(resource, int_t)] != target_state).OnlyEnforceIf(b.Not())
+            is_target[ext_t] = b
+        
+        all_ext_slots = [s[0] for s in all_slots]
+        
+        # For each potential block-end at i and block-start at j with gap < min_gap_days:
+        # Only enforce constraints where j is in current month (ext >= 0)
+        for i in range(n - 1):
+            end_ext = all_ext_slots[i]
+            next_ext = all_ext_slots[i + 1]
+            
+            # Check slots within min_gap_days after end_ext
+            for j in range(i + 2, n):
+                start_ext = all_ext_slots[j]
+                prev_ext = all_ext_slots[j - 1]
+                
+                # Only constrain if start is in current month
+                if start_ext < 0:
+                    continue
+                
+                gap = start_ext - end_ext - 1
+                
+                if gap >= min_gap_days:
+                    break
+                
+                # Block ends at end_ext and starts at start_ext with insufficient gap
+                self.model.AddBoolOr([
+                    is_target[end_ext].Not(),
+                    is_target[next_ext],
+                    is_target[prev_ext],
+                    is_target[start_ext].Not()
+                ])
+
+    def _apply_post_block_rest_constraint(self, constraint: PostBlockRestConstraint):
+        """
+        Apply post-block rest constraint: After any block of target_state ends, 
+        require rest_days of OFF before any other shift.
+        
+        Example: After night block ends (E E -> O), need 2 days OFF before working.
+        Pattern: E E O O 7 is OK, E E O 7 is NOT (only 1 rest day).
+        
+        Cross-month handling: Detects block ends in previous month and enforces
+        rest days that extend into current month.
+        """
+        resource = constraint.resource
+        target_state = constraint.target_state
+        rest_days = constraint.rest_days
+        
+        total_internal_slots = self.previous_month_offset + self.time_slots
+        current_month_start = self.previous_month_offset
+        
+        # Create boolean vars for each internal slot being in target state
+        is_target = {}
+        for int_t in range(total_internal_slots):
+            b = self.model.NewBoolVar(f"post_rest_{resource}_{int_t}_is_{target_state}")
+            self.model.Add(self.shifts[(resource, int_t)] == target_state).OnlyEnforceIf(b)
+            self.model.Add(self.shifts[(resource, int_t)] != target_state).OnlyEnforceIf(b.Not())
+            is_target[int_t] = b
+        
+        # For each slot t, if t is target_state AND t+1 is NOT target_state (block end),
+        # then slots t+1 through t+rest_days must all be OFF (state 0)
+        # But only enforce on slots that are in the CURRENT month (int_t >= current_month_start)
+        for int_t in range(total_internal_slots - 1):
+            # Block end detection: is_target[t] AND NOT is_target[t+1]
+            block_end = self.model.NewBoolVar(f"block_end_{resource}_{int_t}")
+            self.model.AddBoolAnd([is_target[int_t], is_target[int_t + 1].Not()]).OnlyEnforceIf(block_end)
+            self.model.AddBoolOr([is_target[int_t].Not(), is_target[int_t + 1]]).OnlyEnforceIf(block_end.Not())
+            
+            # If block ends at t, then slots t+1 to t+rest_days must be OFF (state 0)
+            # Only enforce on current month slots
+            for d in range(1, rest_days + 1):
+                rest_slot = int_t + d
+                if rest_slot < total_internal_slots and rest_slot >= current_month_start:
+                    self.model.Add(self.shifts[(resource, rest_slot)] == 0).OnlyEnforceIf(block_end)
     
     def _extract_schedule(self, solver: cp_model.CpSolver) -> Dict[str, List[int]]:
         """
