@@ -187,6 +187,32 @@ class MinConsecutiveConstraint(BaseModel):
     is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
 
 
+class MaxConsecutiveConstraint(BaseModel):
+    """Constraint: Maximum consecutive occurrences of a state (prevents excessive consecutive work).
+    
+    Example: Day shifts must not exceed 3 consecutive days (prevents 7 7 7 7 patterns).
+    This prevents patterns like: 7 7 7 7 (4 consecutive not allowed), requires 7 7 7 O (max 3).
+    
+    Special handling: If target_state is -1, applies to ALL non-OFF work states combined.
+    Example with target_state=-1, max_block=3: Prevents 7 7 E E E (5 consecutive work shifts).
+    """
+
+    type: Literal["max_consecutive"] = "max_consecutive"
+    resource: str = Field(..., description="Resource ID")
+    time_slots: List[int] = Field(
+        ...,
+        min_length=1,
+        description="Time slots to evaluate"
+    )
+    target_state: int = Field(
+        ..., 
+        ge=-1, 
+        description="State to limit consecutive occurrences. Use -1 to apply to ALL non-OFF work states combined."
+    )
+    max_block: int = Field(..., ge=1, description="Maximum consecutive occurrences allowed")
+    is_required: bool = Field(True, description="Hard constraint (True) or soft constraint (False)")
+
+
 class NightBlockGapConstraint(BaseModel):
     """Constraint: Minimum gap (in days/slots) between night shift blocks.
     
@@ -265,6 +291,7 @@ ConstraintModel = Union[
     ResourceStateCountConstraint,
     CompoundAttributeVerticalSumConstraint,
     MinConsecutiveConstraint,
+    MaxConsecutiveConstraint,
     NightBlockGapConstraint,
     PostBlockRestConstraint,
 ]

@@ -28,6 +28,7 @@ from src.core.schemas import (
     CompoundAttributeVerticalSumConstraint,
     PreviousMonthAssignment,
     MinConsecutiveConstraint,
+    MaxConsecutiveConstraint,
     NightBlockGapConstraint,
     PostBlockRestConstraint,
 )
@@ -304,6 +305,8 @@ class SolverService:
             self._apply_compound_attribute_vertical_sum_constraint(constraint)
         elif isinstance(constraint, MinConsecutiveConstraint):
             self._apply_min_consecutive_constraint(constraint)
+        elif isinstance(constraint, MaxConsecutiveConstraint):
+            self._apply_max_consecutive_constraint(constraint)
         elif isinstance(constraint, NightBlockGapConstraint):
             self._apply_night_block_gap_constraint(constraint)
         elif isinstance(constraint, PostBlockRestConstraint):
@@ -451,6 +454,10 @@ class SolverService:
             # Min consecutive: Ensure at least one sequence of (value) consecutive target_states
             # This is complex - require at least one window of size (value) to all be target_state
             
+            # Convert external time slots to internal indices
+            sorted_ext_slots = sorted(ext_time_slots)
+            int_time_slots = [self._to_internal_index(ext_t) for ext_t in sorted_ext_slots]
+            
             # Create a bool var for each possible window indicating "all target_state"
             window_bools = []
             
@@ -490,6 +497,10 @@ class SolverService:
         elif operator == "==":
             # Exactly N consecutive: Complex, implement as >= AND <=
             # For now, enforce <= and >= separately
+            
+            # Convert external time slots to internal indices
+            sorted_ext_slots = sorted(ext_time_slots)
+            int_time_slots = [self._to_internal_index(ext_t) for ext_t in sorted_ext_slots]
             
             # Max consecutive (<=)
             window_size = value + 1
@@ -1034,10 +1045,6 @@ class SolverService:
                 next_ext = all_ext_slots[full_idx + 1]
                 neighbors.append(is_target[next_ext])
             
-            # Debug: Log the last few slots
-            if ext_t >= len(sorted_slots) - 3:
-                print(f"[Solver DEBUG] min_consec for {resource} slot {ext_t}: neighbors count={len(neighbors)}, full_idx={full_idx}, all_ext_slots len={len(all_ext_slots)}")
-            
             if neighbors:
                 # If this slot is target_state, at least one neighbor must also be target_state
                 self.model.Add(sum(neighbors) >= 1).OnlyEnforceIf(is_target[ext_t])
@@ -1045,8 +1052,6 @@ class SolverService:
                 # No neighbors means this is an edge slot - for min_block=2, 
                 # we should NOT allow a single isolated target_state at the very edge
                 # unless it's being continued to/from the next/previous month
-                # Force this slot to NOT be target_state if it has no neighbors
-                print(f"[Solver] WARNING: Slot {ext_t} for {resource} has NO neighbors for min_consecutive check - forcing NOT target_state")
                 # If no neighbors (edge case), prevent isolated single at end of month
                 self.model.Add(self.shifts[(resource, self._to_internal_index(ext_t))] != target_state)
     
@@ -1098,13 +1103,79 @@ class SolverService:
         # Incomplete block found! Need to force (min_block - trailing_count) days in current month
         days_needed = min_block - trailing_count
         
-        print(f"[Solver] Forcing {days_needed} days of state {target_state} for {resource} to complete incomplete block from previous month (trailing_count={trailing_count}, min_block={min_block})")
-        
         # Force first N days of current month to be target_state
         for i in range(min(days_needed, len(current_month_slots))):
             ext_t = current_month_slots[i]
             int_t = self._to_internal_index(ext_t)
             self.model.Add(self.shifts[(resource, int_t)] == target_state)
+
+    def _apply_max_consecutive_constraint(self, constraint: MaxConsecutiveConstraint):
+        """
+        Apply max consecutive constraint: Maximum consecutive occurrences of a state.
+        
+        Example: Day shifts must not exceed 3 consecutive (prevents 7 7 7 7 patterns).
+        For max_block=3: 7 7 7 O is OK, 7 7 7 7 is NOT allowed.
+        
+        Special case: If target_state=-1, applies to ALL non-OFF work states combined.
+        Example: target_state=-1, max_block=3 prevents 7 7 E E E (5 consecutive work).
+        
+        Implementation: For every window of (max_block + 1) consecutive time slots,
+        at least one must NOT be the target state (or any work state if target_state=-1).
+        
+        Note: External time slots converted to internal indices.
+        Respects cross-month boundaries via previous_month_offset.
+        """
+        resource = constraint.resource
+        ext_time_slots = constraint.time_slots
+        target_state = constraint.target_state
+        max_block = constraint.max_block
+        
+        # Sort time slots
+        sorted_slots = sorted(ext_time_slots)
+        n = len(sorted_slots)
+        
+        if n < max_block + 1:
+            return  # Not enough slots to violate the max
+        
+        # Include previous month days in the slot range for cross-month constraints
+        all_internal_slots = []
+        
+        # Add previous month slots (if any)
+        for prev_int_t in range(self.previous_month_offset):
+            all_internal_slots.append((-self.previous_month_offset + prev_int_t, prev_int_t))  # (virtual_ext, int_t)
+        
+        # Add current month slots
+        for ext_t in sorted_slots:
+            int_t = self._to_internal_index(ext_t)
+            all_internal_slots.append((ext_t, int_t))
+        
+        # Create boolean vars for ALL slots (including previous month)
+        is_target = {}
+        for (ext_t, int_t) in all_internal_slots:
+            b = self.model.NewBoolVar(f"max_consec_{resource}_{ext_t}_is_{target_state}")
+            
+            if target_state == -1:
+                # Special case: Check if ANY work state (non-zero)
+                # b is True if shift is ANY work state (state > 0)
+                self.model.Add(self.shifts[(resource, int_t)] > 0).OnlyEnforceIf(b)
+                self.model.Add(self.shifts[(resource, int_t)] == 0).OnlyEnforceIf(b.Not())
+            else:
+                # Normal case: Check specific state
+                self.model.Add(self.shifts[(resource, int_t)] == target_state).OnlyEnforceIf(b)
+                self.model.Add(self.shifts[(resource, int_t)] != target_state).OnlyEnforceIf(b.Not())
+            
+            is_target[ext_t] = b
+        
+        # For each window of (max_block + 1) consecutive slots, at least one must NOT be target
+        all_ext_slots = [s[0] for s in all_internal_slots]
+        
+        for i in range(len(all_ext_slots) - max_block):
+            window_slots = all_ext_slots[i:i + max_block + 1]
+            window_bools = [is_target[ext_t] for ext_t in window_slots]
+            
+            # At least one of these (max_block + 1) slots must NOT be target_state
+            # Equivalently: sum of target bools must be <= max_block
+            self.model.Add(sum(window_bools) <= max_block)
 
     def _apply_night_block_gap_constraint(self, constraint: NightBlockGapConstraint):
         """
